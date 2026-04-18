@@ -639,6 +639,11 @@ function decodePatientAccessToken(
     };
 }
 
+// Root endpoint for Vercel health checks
+app.get('/', (_req: Request, res: Response) => {
+    res.json({ status: 'ok', message: 'EHIS Backend API' });
+});
+
 // Routes
 app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ status: 'ok', version: '2.1-tokenized-qr' });
@@ -1455,24 +1460,44 @@ app.post('/api/access-logs/sync-offline', (req: Request, res: Response) => {
     });
 });
 
+// 404 handler
+app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Route not found' });
+});
+
+// Error handler
+app.use((err: any, _req: Request, res: Response) => {
+    console.error('Error:', err);
+    res.status(err.status || 500).json({ 
+        error: err.message || 'Internal server error',
+        status: err.status || 500
+    });
+});
+
 const PORT = process.env['PORT'] || 5000;
 
-app.listen(PORT, () => {
-    console.log(`EHIS Backend running on port ${PORT}`);
-    console.log(`Available patients: ${patients.map((p) => p.patientId).join(', ')}`);
-    console.log('');
-    console.log('Routes:');
-    console.log('  GET  /api/health');
-    console.log('  GET  /api/patients');
-    console.log('  GET  /api/doctors/:doctorId/verification');
-    console.log('  GET  /api/notifications/:userId');
-    console.log('  POST /api/qr/generate');
-    console.log('  POST /api/qr/decode');
-    console.log('  GET  /api/qr/sessions/:patientId');
-    console.log('  PUT  /api/qr/revoke');
-    console.log('  POST /api/nfc/generate');
-    console.log('  POST /api/nfc/decode');
-    console.log('  POST /api/patients/:patientId/ai-summary');
-    console.log('  PUT  /api/networks/hospital-sharing');
-    console.log('  GET  /api/networks/my-enrollment/:patientId');
-});
+// Export app for Vercel serverless
+export default app;
+
+// Only listen if not running on Vercel
+if (process.env.VERCEL !== '1' && !process.env.VERCEL_ENV) {
+    app.listen(PORT, () => {
+        console.log(`EHIS Backend running on port ${PORT}`);
+        console.log(`Available patients: ${patients.map((p) => p.patientId).join(', ')}`);
+        console.log('');
+        console.log('Routes:');
+        console.log('  GET  /api/health');
+        console.log('  GET  /api/patients');
+        console.log('  GET  /api/doctors/:doctorId/verification');
+        console.log('  GET  /api/notifications/:userId');
+        console.log('  POST /api/qr/generate');
+        console.log('  POST /api/qr/decode');
+        console.log('  GET  /api/qr/sessions/:patientId');
+        console.log('  PUT  /api/qr/revoke');
+        console.log('  POST /api/nfc/generate');
+        console.log('  POST /api/nfc/decode');
+        console.log('  POST /api/patients/:patientId/ai-summary');
+        console.log('  PUT  /api/networks/hospital-sharing');
+        console.log('  GET  /api/networks/my-enrollment/:patientId');
+    });
+}
