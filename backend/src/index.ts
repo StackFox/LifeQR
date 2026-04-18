@@ -1465,8 +1465,8 @@ app.use((_req: Request, res: Response) => {
     res.status(404).json({ error: 'Route not found' });
 });
 
-// Error handler
-app.use((err: any, _req: Request, res: Response) => {
+// Error handler (must have 4 params for Express to recognize it)
+app.use((err: any, _req: Request, res: Response, _next: any) => {
     console.error('Error:', err);
     res.status(err.status || 500).json({ 
         error: err.message || 'Internal server error',
@@ -1474,14 +1474,14 @@ app.use((err: any, _req: Request, res: Response) => {
     });
 });
 
-const PORT = process.env['PORT'] || 5000;
+const PORT = parseInt(process.env['PORT'] || '5000', 10);
+const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
 
-// Export app for Vercel serverless
-export default app;
-
-// Only listen if not running on Vercel
-if (process.env.VERCEL !== '1' && !process.env.VERCEL_ENV) {
-    app.listen(PORT, () => {
+// Start server if not on Vercel
+if (!isVercel) {
+    console.log('[SERVER] Starting backend...');
+    
+    const server = app.listen(PORT, '0.0.0.0', () => {
         console.log(`EHIS Backend running on port ${PORT}`);
         console.log(`Available patients: ${patients.map((p) => p.patientId).join(', ')}`);
         console.log('');
@@ -1500,4 +1500,43 @@ if (process.env.VERCEL !== '1' && !process.env.VERCEL_ENV) {
         console.log('  PUT  /api/networks/hospital-sharing');
         console.log('  GET  /api/networks/my-enrollment/:patientId');
     });
+    
+    // Handle server errors
+    server.on('error', (error) => {
+        console.error('[SERVER] Error:', error);
+    });
+    
+    // Handle process errors
+    process.on('uncaughtException', (error) => {
+        console.error('[PROCESS] Uncaught Exception:', error);
+    });
+    
+    process.on('unhandledRejection', (reason) => {
+        console.error('[PROCESS] Unhandled Rejection:', reason);
+    });
+    
+    // Graceful shutdown handlers
+    const handleShutdown = (signal: string) => {
+        console.log(`[SHUTDOWN] ${signal} received`);
+        server.close(() => {
+            console.log('[SHUTDOWN] Server closed gracefully');
+            process.exit(0);
+        });
+        
+        // Force shutdown after 10 seconds
+        setTimeout(() => {
+            console.error('[SHUTDOWN] Forced shutdown');
+            process.exit(1);
+        }, 10000);
+    };
+    
+    process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+    process.on('SIGINT', () => handleShutdown('SIGINT'));
+    
+    // Keep process alive
+    process.stdin.resume();
+    console.log('[SERVER] Process event listeners registered. Server is running.');
 }
+
+// Export app for Vercel serverless
+export default app;
