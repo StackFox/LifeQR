@@ -1,0 +1,804 @@
+import express from 'express';
+import type { Request, Response } from 'express';
+import cors from 'cors';
+import { v4 as uuidv4 } from 'uuid';
+import { createAPIRoutes } from './routes/notifications.js';
+import { assessPatientRisk } from './services/riskEngine.js';
+import { generateKeyPair, encryptPayload, keyPairToHex, hexToUint8Array, decryptPayload } from './services/qrEncryption.js';
+import { buildFHIRBundle } from './services/fhirBuilder.js';
+import multer from 'multer';
+import fs from 'fs';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pdfParse = require('pdf-parse');
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { QdrantClient } from '@qdrant/js-client-rest';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+
+console.error('🚀 EXPRESS APP CREATED');
+
+app.use(cors());
+app.use(express.json());
+
+console.error('🚀 CORS AND JSON MIDDLEWARE ADDED');
+
+// Log ALL requests FIRST, before other middleware
+app.use((req: any, res: any, next: any) => {
+  console.error(`📨 ${req.method} ${req.path}`);
+  next();
+});
+
+console.error('🚀 REQUEST LOGGER MIDDLEWARE ADDED');
+
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+
+const upload = multer({ dest: 'uploads/' });
+const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "AIzaSy_fake-gemini-key");
+
+// ─── MOCK DATA ──────────────────────────────────────────────
+// Pre-generate keypairs for demo patients
+const demoKeyPairs = {
+  'P-12345': generateKeyPair(),
+  'P-67890': generateKeyPair(),
+  'P-11111': generateKeyPair(),
+  'P-22222': generateKeyPair(),
+};
+
+const patients = [
+  {
+    patientId: 'P-12345',
+    name: 'Jane Doe',
+    dateOfBirth: '1985-04-12',
+    bloodType: 'O-',
+    emergencyContacts: [{ name: 'John Doe', relationship: 'Spouse', phone: '555-0199' }],
+    medications: [{ name: 'Lisinopril', dosage: '10mg', frequency: 'Daily' }],
+    allergies: ['Penicillin', 'Peanuts'],
+    conditions: ['Hypertension'],
+    implants: [] as string[],
+    documents: [] as { id: string, name: string, url: string, uploadedAt: string }[],
+  },
+  {
+    patientId: 'P-67890',
+    name: 'Robert Chen',
+    dateOfBirth: '1957-11-03',
+    bloodType: 'A+',
+    emergencyContacts: [
+      { name: 'Linda Chen', relationship: 'Wife', phone: '555-0234' },
+      { name: 'Michael Chen', relationship: 'Son', phone: '555-0235' },
+    ],
+    medications: [
+      { name: 'Warfarin', dosage: '5mg', frequency: 'Daily' },
+      { name: 'Metformin', dosage: '1000mg', frequency: 'Twice daily' },
+      { name: 'Lisinopril', dosage: '20mg', frequency: 'Daily' },
+      { name: 'Atorvastatin', dosage: '40mg', frequency: 'Daily' },
+      { name: 'Metoprolol', dosage: '50mg', frequency: 'Daily' },
+      { name: 'Aspirin', dosage: '81mg', frequency: 'Daily' },
+    ],
+    allergies: ['Penicillin', 'Sulfa drugs', 'Iodine contrast'],
+    conditions: ['Type 2 Diabetes', 'Atrial Fibrillation', 'Hypertension', 'Coronary Artery Disease'],
+    implants: ['Pacemaker (Medtronic, 2022)'],
+    documents: [] as { id: string, name: string, url: string, uploadedAt: string }[],
+  },
+  {
+    patientId: 'P-11111',
+    name: 'Sarah Thompson',
+    dateOfBirth: '1992-07-22',
+    bloodType: 'B+',
+    emergencyContacts: [{ name: 'James Thompson', relationship: 'Father', phone: '555-0300' }],
+    medications: [
+      { name: 'Albuterol inhaler', dosage: '2 puffs', frequency: 'As needed' },
+      { name: 'Fluticasone', dosage: '220mcg', frequency: 'Twice daily' },
+    ],
+    allergies: ['Latex'],
+    conditions: [],
+    implants: [] as string[],
+    documents: [] as { id: string, name: string, url: string, uploadedAt: string }[],
+  },
+  {
+    patientId: 'P-22222',
+    name: 'Harold Martinez',
+    dateOfBirth: '1948-02-15',
+    bloodType: 'AB-',
+    emergencyContacts: [
+      { name: 'Maria Martinez', relationship: 'Wife', phone: '555-0400' },
+      { name: 'Carlos Martinez', relationship: 'Son', phone: '555-0401' },
+    ],
+    medications: [
+      { name: 'Rivaroxaban', dosage: '20mg', frequency: 'Daily' },
+      { name: 'Donepezil', dosage: '10mg', frequency: 'Daily' },
+      { name: 'Memantine', dosage: '10mg', frequency: 'Twice daily' },
+      { name: 'Amlodipine', dosage: '5mg', frequency: 'Daily' },
+      { name: 'Omeprazole', dosage: '20mg', frequency: 'Daily' },
+    ],
+    allergies: ['Codeine', 'Shellfish', 'Aspirin', 'NSAIDs'],
+    conditions: ['Alzheimer\'s Disease', 'Hypertension', 'GERD', 'History of DVT'],
+    implants: ['Insulin pump (Omnipod, 2024)'],
+    documents: [] as { id: string, name: string, url: string, uploadedAt: string }[],
+  },
+];
+
+// In-memory notifications & access requests
+const notifications: Array<{
+  notificationId: string;
+  userId: string;
+  userRole: 'PATIENT' | 'DOCTOR';
+  type: 'ACCESS_LOG' | 'ACCESS_REQUEST' | 'SYSTEM';
+  title: string;
+  message: string;
+  relatedUserId?: string;
+  patientId?: string;
+  doctorId?: string;
+  status: 'UNREAD' | 'READ';
+  createdAt: string;
+  actionRequired?: boolean;
+}> = [];
+
+const accessRequests: Array<{
+  requestId: string;
+  patientId: string;
+  doctorId: string;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  requestedAt: string;
+  respondedAt?: string;
+  reason?: string;
+}> = [];
+
+// In-memory access logs
+const accessLogs: Array<{
+  logId: string;
+  patientId: string;
+  doctorId: string;
+  hospitalId: string;
+  qrTokenId: string;
+  scanTimestamp: number;
+  offlineDecrypted: boolean;
+  syncedAt: string;
+}> = [];
+
+// In-memory networks
+const networks: Array<{
+  networkId: string;
+  name: string;
+  description: string;
+  hospitals: Array<{ hospitalId: string; hospitalName: string; ehrSystem: string; city: string; state: string; joinedAt: string; isActive: boolean }>;
+  patients: Array<{ patientId: string; enrolledAt: string; consentLevel: string; dataSharedWith: string[] }>;
+  createdAt: string;
+  tier: string;
+}> = [
+  {
+    networkId: 'network_northeast_alliance',
+    name: 'Northeast Emergency Alliance',
+    description: 'Regional network covering hospitals in the Northeast US for emergency data sharing',
+    hospitals: [
+      { hospitalId: 'H-001', hospitalName: 'Mass General Hospital', ehrSystem: 'EPIC', city: 'Boston', state: 'MA', joinedAt: new Date().toISOString(), isActive: true },
+      { hospitalId: 'H-002', hospitalName: 'NYU Langone', ehrSystem: 'EPIC', city: 'New York', state: 'NY', joinedAt: new Date().toISOString(), isActive: true },
+      { hospitalId: 'H-003', hospitalName: 'Yale New Haven', ehrSystem: 'CERNER', city: 'New Haven', state: 'CT', joinedAt: new Date().toISOString(), isActive: true },
+    ],
+    patients: [
+      { patientId: 'P-67890', enrolledAt: new Date().toISOString(), consentLevel: 'FULL', dataSharedWith: ['H-001', 'H-002', 'H-003'] },
+      { patientId: 'P-22222', enrolledAt: new Date().toISOString(), consentLevel: 'EMERGENCY_ONLY', dataSharedWith: ['H-001', 'H-002'] },
+    ],
+    createdAt: new Date().toISOString(),
+    tier: 'PREMIUM'
+  }
+];
+
+// ─── ROUTES ─────────────────────────────────────────────────
+
+// Health check
+app.get('/api/health', (_req: Request, res: Response) => {
+  console.error('✅ /api/health handler called');
+  res.json({ status: 'ok', version: '2.0', uptime: process.uptime() });
+});
+
+// ─── QR GENERATION ──────────────────────────────────────────
+
+// Generate offline QR with NaCl encryption
+app.post('/api/qr/generate', (req: Request, res: Response) => {
+  const { patientId } = req.body as { patientId: string };
+  const patient = patients.find(p => p.patientId === patientId);
+
+  if (!patient) {
+    res.status(404).json({ error: 'Patient not found' });
+    return;
+  }
+
+  // Run risk assessment
+  const riskAssessment = assessPatientRisk({
+    dateOfBirth: patient.dateOfBirth,
+    medications: patient.medications,
+    allergies: patient.allergies,
+    conditions: patient.conditions,
+    implants: patient.implants,
+  });
+
+  // Build AI summary
+  const medicalSummary = buildMedicalSummary(patient);
+
+  const payload = {
+    patientId: patient.patientId,
+    qrTokenId: uuidv4(),
+    name: patient.name,
+    dateOfBirth: patient.dateOfBirth,
+    bloodType: patient.bloodType,
+    emergencyContacts: patient.emergencyContacts,
+    medications: patient.medications,
+    allergies: patient.allergies,
+    conditions: patient.conditions,
+    implants: patient.implants,
+    medicalSummary,
+    riskAssessment,
+    lastUpdated: Date.now(),
+    expiryTime: Date.now() + (30 * 24 * 60 * 60 * 1000), // 30 days
+    encryptionVersion: 'v1',
+    accessLog: [],
+    consentLevel: 'FULL',
+  };
+
+  // Encrypt with patient's public key
+  const keyPair = demoKeyPairs[patientId as keyof typeof demoKeyPairs];
+  let encryptedPayload: string;
+
+  if (keyPair) {
+    encryptedPayload = encryptPayload(JSON.stringify(payload), keyPair.publicKey);
+  } else {
+    // Fallback: base64 encode
+    encryptedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
+  }
+
+  res.json({
+    encryptedPayload,
+    qrTokenId: payload.qrTokenId,
+    expiryTime: payload.expiryTime,
+    dataSize: encryptedPayload.length,
+    // Include raw + secret key for demo/testing (in production, secret key stays on device)
+    raw: payload,
+    _demo_secretKey: keyPair ? keyPairToHex(keyPair).secretKey : null,
+  });
+});
+
+// List all available patients
+app.get('/api/patients', (_req: Request, res: Response) => {
+  res.json(patients.map(p => ({
+    patientId: p.patientId,
+    name: p.name,
+    bloodType: p.bloodType,
+    conditionCount: p.conditions.length,
+    medicationCount: p.medications.length,
+    allergyCount: p.allergies.length,
+  })));
+});
+
+// Get patient detail
+app.get('/api/patients/:patientId', (req: Request, res: Response) => {
+  const patient = patients.find(p => p.patientId === req.params['patientId']);
+  if (!patient) {
+    res.status(404).json({ error: 'Patient not found' });
+    return;
+  }
+  res.json(patient);
+});
+
+// ─── RISK ASSESSMENT ────────────────────────────────────────
+
+// Get risk assessment for a patient
+app.get('/api/risk/:patientId', (req: Request, res: Response) => {
+  const patient = patients.find(p => p.patientId === req.params['patientId']);
+  if (!patient) {
+    res.status(404).json({ error: 'Patient not found' });
+    return;
+  }
+
+  const assessment = assessPatientRisk({
+    dateOfBirth: patient.dateOfBirth,
+    medications: patient.medications,
+    allergies: patient.allergies,
+    conditions: patient.conditions,
+    implants: patient.implants,
+  });
+
+  res.json(assessment);
+});
+
+// ─── MEDICAL RECORDS UPLOAD (PDF) ───────────────────────────
+app.post('/api/patients/:patientId/upload-records', upload.single('record'), async (req: Request, res: Response) => {
+  const patientId = req.params['patientId'] as string;
+  const patient = patients.find(p => p.patientId === patientId);
+  if (!patient) return res.status(404).json({ error: 'Patient not found' });
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+  try {
+    const filePath = req.file.path;
+    const dataBuffer = fs.readFileSync(filePath);
+    const pdfData = await pdfParse(dataBuffer);
+    const text = pdfData.text;
+
+    // Simulate AI extraction and Vector DB if no API key
+    let extractedData = {
+      conditions: ['AI Extracted: Hypertension'],
+      medications: [{ name: 'Lisinopril', dosage: '10mg', frequency: 'Daily' }],
+      allergies: ['Penicillin']
+    };
+
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const result = await model.generateContent(`Extract conditions, medications, and allergies from this medical record text. Output ONLY raw JSON format: { "conditions": ["string"], "medications": [{ "name": "string", "dosage": "string", "frequency": "string" }], "allergies": ["string"] }.\n\nText:\n${text}`);
+        const responseText = result.response.text();
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) extractedData = JSON.parse(jsonMatch[0]);
+      } catch (geminiErr) {
+        console.error("Gemini Extraction Error:", geminiErr);
+      }
+
+      try {
+        const embedModel = genAI.getGenerativeModel({ model: "embedding-001" });
+        const embedResult = await embedModel.embedContent(text.substring(0, 2000));
+        const vector = (embedResult.embedding.values) as number[];
+        const vectorDim = vector.length;
+
+        console.log(`Generated vector dimension: ${vectorDim}`);
+
+        try {
+          await qdrant.getCollection('patient_records');
+        } catch (e) {
+          await qdrant.createCollection('patient_records', {
+            vectors: { size: vectorDim, distance: 'Cosine' }
+          });
+          console.log('Created Qdrant collection');
+        }
+
+        await qdrant.upsert('patient_records', {
+          wait: true,
+          points: [{
+            id: Math.floor(Math.random() * 1000000),
+            vector,
+            payload: {
+              patientId,
+              fileName: req.file?.originalname,
+              textPreview: text.substring(0, 300),
+              uploadedAt: new Date().toISOString()
+            }
+          }]
+        });
+        console.log('Vector uploaded to Qdrant');
+      } catch (qdrantErr) {
+        console.error("Qdrant/Embedding Error:", qdrantErr);
+      }
+    }
+
+    patient.conditions.push(...extractedData.conditions);
+    patient.medications.push(...extractedData.medications);
+    patient.allergies.push(...extractedData.allergies);
+
+    // Filter duplicates
+    patient.conditions = [...new Set(patient.conditions)];
+    patient.allergies = [...new Set(patient.allergies)];
+
+    if (!patient.documents) patient.documents = [];
+    patient.documents.push({ 
+        id: uuidv4(), 
+        name: req.file.originalname, 
+        url: `/uploads/${req.file.filename}`,
+        uploadedAt: new Date().toISOString()
+    });
+
+    // Create notification for patient
+    notifications.push({
+      notificationId: uuidv4(),
+      userId: patientId,
+      userRole: 'PATIENT',
+      type: 'SYSTEM',
+      title: '📄 Medical Record Uploaded',
+      message: `Your file "${req.file?.originalname || 'document'}" has been processed and stored securely.`,
+      patientId,
+      status: 'UNREAD',
+      createdAt: new Date().toISOString()
+    });
+
+    res.json({ success: true, documents: patient.documents, extractedData });
+  } catch (e) {
+    console.error('File upload error:', e);
+    res.status(500).json({ error: 'Failed to process document' });
+  }
+});
+
+// ─── ACCESS LOG SYNC ────────────────────────────────────────
+
+// Sync offline access logs
+app.post('/api/access-logs/sync-offline', (req: Request, res: Response) => {
+  const { qrTokenId, patientId, doctorId, hospitalId, scanTimestamp } = req.body as {
+    qrTokenId: string;
+    patientId: string;
+    doctorId: string;
+    hospitalId: string;
+    scanTimestamp: number;
+  };
+
+  const logEntry = {
+    logId: uuidv4(),
+    patientId,
+    doctorId,
+    hospitalId,
+    qrTokenId,
+    scanTimestamp,
+    offlineDecrypted: true,
+    syncedAt: new Date().toISOString(),
+  };
+
+  accessLogs.push(logEntry);
+
+  // Create notification for PATIENT: doctor accessed their data
+  notifications.push({
+    notificationId: uuidv4(),
+    userId: patientId,
+    userRole: 'PATIENT',
+    type: 'ACCESS_LOG',
+    title: '👁️ Your Data Was Accessed',
+    message: `Doctor ${doctorId} accessed your emergency QR data.`,
+    relatedUserId: doctorId,
+    patientId,
+    doctorId,
+    status: 'UNREAD',
+    createdAt: new Date().toISOString()
+  });
+
+  // Create notification for DOCTOR: confirmation
+  notifications.push({
+    notificationId: uuidv4(),
+    userId: doctorId,
+    userRole: 'DOCTOR',
+    type: 'ACCESS_LOG',
+    title: '✅ Patient Data Retrieved',
+    message: `Successfully accessed emergency data for patient ${patientId}.`,
+    relatedUserId: patientId,
+    patientId,
+    doctorId,
+    status: 'UNREAD',
+    createdAt: new Date().toISOString()
+  });
+
+  res.json({
+    success: true,
+    logId: logEntry.logId,
+    syncedAt: logEntry.syncedAt,
+  });
+});
+
+// Get access logs for a patient
+app.get('/api/access-logs/:patientId', (req: Request, res: Response) => {
+  const logs = accessLogs.filter(l => l.patientId === req.params['patientId']);
+  res.json({ totalAccesses: logs.length, logs });
+});
+
+// ─── NOTIFICATIONS ──────────────────────────────────────────
+
+// Mark notification as read
+app.put('/api/notifications/:notificationId/read', (req: Request, res: Response) => {
+  const notif = notifications.find(n => n.notificationId === req.params['notificationId']);
+  if (!notif) return res.status(404).json({ error: 'Notification not found' });
+  notif.status = 'READ';
+  res.json({ success: true });
+});
+
+// ─── ACCESS REQUESTS ────────────────────────────────────────
+console.log('⏳ Registering access request routes...');
+
+// Create access request (doctor requests patient data)
+app.post('/api/access-requests', (req: Request, res: Response) => {
+  const { patientId, doctorId, reason } = req.body as {
+    patientId: string;
+    doctorId: string;
+    reason?: string;
+  };
+
+  const requestId = uuidv4();
+  accessRequests.push({
+    requestId,
+    patientId,
+    doctorId,
+    status: 'PENDING',
+    requestedAt: new Date().toISOString(),
+    reason,
+  });
+
+  // Notify PATIENT: doctor requested access
+  notifications.push({
+    notificationId: uuidv4(),
+    userId: patientId,
+    userRole: 'PATIENT',
+    type: 'ACCESS_REQUEST',
+    title: '🔐 Data Access Request',
+    message: `Doctor ${doctorId} requested access to your medical data. Reason: ${reason || 'Emergency care'}`,
+    relatedUserId: doctorId,
+    patientId,
+    doctorId,
+    status: 'UNREAD',
+    actionRequired: true,
+    createdAt: new Date().toISOString()
+  });
+
+  res.json({ success: true, requestId });
+});
+console.log('✓ POST /api/access-requests registered');
+
+// Get access requests for a patient
+app.get('/api/access-requests/patient/:patientId', (req: Request, res: Response) => {
+  const reqs = accessRequests.filter(r => r.patientId === req.params['patientId']);
+  res.json({ requests: reqs });
+});
+
+// Approve access request
+app.put('/api/access-requests/:requestId/approve', (req: Request, res: Response) => {
+  const request = accessRequests.find(r => r.requestId === req.params['requestId']);
+  if (!request) return res.status(404).json({ error: 'Request not found' });
+
+  request.status = 'APPROVED';
+  request.respondedAt = new Date().toISOString();
+
+  // Notify DOCTOR: request approved
+  notifications.push({
+    notificationId: uuidv4(),
+    userId: request.doctorId,
+    userRole: 'DOCTOR',
+    type: 'ACCESS_REQUEST',
+    title: '✅ Access Approved',
+    message: `Patient ${request.patientId} approved your data access request.`,
+    relatedUserId: request.patientId,
+    patientId: request.patientId,
+    doctorId: request.doctorId,
+    status: 'UNREAD',
+    createdAt: new Date().toISOString()
+  });
+
+  res.json({ success: true });
+});
+
+// Reject access request
+app.put('/api/access-requests/:requestId/reject', (req: Request, res: Response) => {
+  const request = accessRequests.find(r => r.requestId === req.params['requestId']);
+  if (!request) return res.status(404).json({ error: 'Request not found' });
+
+  request.status = 'REJECTED';
+  request.respondedAt = new Date().toISOString();
+
+  // Notify DOCTOR: request rejected
+  notifications.push({
+    notificationId: uuidv4(),
+    userId: request.doctorId,
+    userRole: 'DOCTOR',
+    type: 'ACCESS_REQUEST',
+    title: '❌ Access Rejected',
+    message: `Patient ${request.patientId} rejected your data access request.`,
+    relatedUserId: request.patientId,
+    patientId: request.patientId,
+    doctorId: request.doctorId,
+    status: 'UNREAD',
+    createdAt: new Date().toISOString()
+  });
+
+  res.json({ success: true });
+});
+
+// ─── FHIR EXPORT ────────────────────────────────────────────
+
+// Export patient as FHIR Bundle
+app.get('/api/fhir/patient/:patientId', (req: Request, res: Response) => {
+  const patient = patients.find(p => p.patientId === req.params['patientId']);
+  if (!patient) {
+    res.status(404).json({ error: 'Patient not found' });
+    return;
+  }
+
+  const bundle = buildFHIRBundle(patient);
+  res.setHeader('Content-Type', 'application/fhir+json');
+  res.json(bundle);
+});
+
+// ─── NETWORK ROUTES ─────────────────────────────────────────
+
+// List networks
+app.get('/api/networks', (_req: Request, res: Response) => {
+  res.json(networks);
+});
+
+// Create network
+app.post('/api/networks', (req: Request, res: Response) => {
+  const { networkName, description, hospitals } = req.body as {
+    networkName: string;
+    description: string;
+    hospitals: Array<{ hospitalId: string; hospitalName: string; ehrSystem: string; city: string; state: string }>;
+  };
+
+  const network = {
+    networkId: `network_${uuidv4().substring(0, 8)}`,
+    name: networkName,
+    description,
+    hospitals: (hospitals || []).map((h) => ({
+      ...h,
+      joinedAt: new Date().toISOString(),
+      isActive: true,
+    })),
+    patients: [] as Array<{ patientId: string; enrolledAt: string; consentLevel: string; dataSharedWith: string[] }>,
+    createdAt: new Date().toISOString(),
+    tier: 'PREMIUM',
+  };
+
+  networks.push(network);
+  res.json(network);
+});
+
+// Enroll patient in network
+app.post('/api/networks/:networkId/enroll', (req: Request, res: Response) => {
+  const { patientId, consentLevel } = req.body as { patientId: string; consentLevel: string };
+  const network = networks.find(n => n.networkId === req.params['networkId']);
+
+  if (!network) {
+    res.status(404).json({ error: 'Network not found' });
+    return;
+  }
+
+  network.patients.push({
+    patientId,
+    enrolledAt: new Date().toISOString(),
+    consentLevel,
+    dataSharedWith: network.hospitals.map(h => h.hospitalId),
+  });
+
+  res.json({ success: true, networkId: network.networkId });
+});
+
+// Fetch patient from network (doctor endpoint)
+app.post('/api/networks/fetch-patient', (req: Request, res: Response) => {
+  const { patientId } = req.body as { patientId: string };
+
+  // Find which network patient belongs to
+  const network = networks.find(n => n.patients.some(p => p.patientId === patientId));
+  if (!network) {
+    res.status(403).json({ error: 'Patient not in accessible network' });
+    return;
+  }
+
+  const patient = patients.find(p => p.patientId === patientId);
+  if (!patient) {
+    res.status(404).json({ error: 'Patient not found' });
+    return;
+  }
+
+  const enrollment = network.patients.find(p => p.patientId === patientId)!;
+
+  res.json({
+    patientId: patient.patientId,
+    name: patient.name,
+    dateOfBirth: patient.dateOfBirth,
+    bloodType: patient.bloodType,
+    emergencyContacts: patient.emergencyContacts,
+    medications: enrollment.consentLevel !== 'ANONYMIZED' ? patient.medications : [],
+    allergies: patient.allergies,
+    conditions: patient.conditions,
+    network: {
+      networkId: network.networkId,
+      networkName: network.name,
+      consentLevel: enrollment.consentLevel,
+      hospitalCount: network.hospitals.length,
+    },
+  });
+});
+
+// Patient enrollment info
+app.get('/api/networks/my-enrollment/:patientId', (req: Request, res: Response) => {
+  const patientId = req.params['patientId'];
+  const network = networks.find(n => n.patients.some(p => p.patientId === patientId));
+
+  if (!network) {
+    res.json({ enrolled: false, enrollment: null, accessHistory: [] });
+    return;
+  }
+
+  const enrollment = network.patients.find(p => p.patientId === patientId);
+  const patientLogs = accessLogs.filter(l => l.patientId === patientId);
+
+  res.json({
+    enrolled: true,
+    enrollment: {
+      networkId: network.networkId,
+      networkName: network.name,
+      consentLevel: enrollment?.consentLevel,
+      sharedDataTypes: ['MEDICATIONS', 'ALLERGIES', 'CONDITIONS', 'VITAL_SIGNS'],
+      hospitalCount: network.hospitals.length,
+      hospitals: network.hospitals,
+    },
+    accessHistory: patientLogs,
+  });
+});
+
+// Update patient consent
+app.put('/api/networks/update-consent', (req: Request, res: Response) => {
+  const { patientId, consentLevel } = req.body as { patientId: string; consentLevel: string };
+  const network = networks.find(n => n.patients.some(p => p.patientId === patientId));
+
+  if (!network) {
+    res.status(404).json({ error: 'Network not found' });
+    return;
+  }
+
+  const enrollment = network.patients.find(p => p.patientId === patientId)!;
+  enrollment.consentLevel = consentLevel;
+
+  res.json({ success: true, consentLevel });
+});
+
+// Leave network
+app.post('/api/networks/leave', (req: Request, res: Response) => {
+  const { patientId } = req.body as { patientId: string };
+  const network = networks.find(n => n.patients.some(p => p.patientId === patientId));
+
+  if (!network) {
+    res.status(404).json({ error: 'Network not found' });
+    return;
+  }
+
+  network.patients = network.patients.filter(p => p.patientId !== patientId);
+
+  res.json({ success: true });
+});
+
+// ─── DECRYPT ENDPOINT (demo only) ──────────────────────────
+
+// Demo endpoint: decrypt a QR payload with patient's secret key
+app.post('/api/qr/decrypt', (req: Request, res: Response) => {
+  const { encryptedPayload, patientId } = req.body as { encryptedPayload: string; patientId: string };
+
+  const keyPair = demoKeyPairs[patientId as keyof typeof demoKeyPairs];
+  if (!keyPair) {
+    res.status(400).json({ error: 'No keypair found for patient' });
+    return;
+  }
+
+  try {
+    const decrypted = decryptPayload(encryptedPayload, keyPair.secretKey);
+    res.json({ success: true, data: JSON.parse(decrypted) });
+  } catch (err) {
+    res.status(400).json({ error: 'Decryption failed', details: String(err) });
+  }
+});
+
+// ─── HELPERS ────────────────────────────────────────────────
+
+function buildMedicalSummary(patient: typeof patients[0]): string {
+  const parts: string[] = [];
+
+  if (patient.conditions.length > 0) {
+    parts.push(`Active conditions: ${patient.conditions.join(', ')}.`);
+  }
+  if (patient.medications.length > 0) {
+    parts.push(`Currently on ${patient.medications.length} medication(s): ${patient.medications.map(m => `${m.name} ${m.dosage}`).join(', ')}.`);
+  }
+  if (patient.allergies.length > 0) {
+    parts.push(`Known allergies: ${patient.allergies.join(', ')}.`);
+  }
+  if (patient.implants.length > 0) {
+    parts.push(`Implanted devices: ${patient.implants.join(', ')}.`);
+  }
+
+  return parts.join(' ') || 'No significant medical history recorded.';
+}
+
+// ─── START SERVER ───────────────────────────────────────────
+
+// Mount API routes from separate router (AFTER all direct app routes)
+const apiRouter = createAPIRoutes(notifications, accessRequests);
+app.use('/api', apiRouter);
+
+const PORT = process.env['PORT'] || 5000;
+app.listen(PORT, () => {
+  console.log(`EHIS Backend v2.0 running on port ${PORT}`);
+  console.log(`Available patients: ${patients.map(p => p.patientId).join(', ')}`);
+});
