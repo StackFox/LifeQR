@@ -146,7 +146,10 @@ interface VectorIndexResult {
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const qdrant = new QdrantClient({ url: process.env.QDRANT_URL || 'http://localhost:6333' });
+const qdrant = new QdrantClient({ 
+  url: process.env.QDRANT_URL || 'http://localhost:6333',
+  apiKey: process.env.QDRANT_API_KEY
+});
 const EMBEDDING_MODEL = 'text-embedding-004';
 const SUMMARY_MODEL = 'gemini-1.5-flash';
 const MEDICAL_VECTOR_COLLECTION = 'medical_records_rag_v1';
