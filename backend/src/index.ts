@@ -146,13 +146,26 @@ interface VectorIndexResult {
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
+const qdrant = new QdrantClient({ url: process.env.QDRANT_URL || 'http://localhost:6333' });
 const EMBEDDING_MODEL = 'text-embedding-004';
 const SUMMARY_MODEL = 'gemini-1.5-flash';
 const MEDICAL_VECTOR_COLLECTION = 'medical_records_rag_v1';
 
+// CORS Configuration
+const corsOptions = {
+  origin: [
+    'https://life-qr-frontend.vercel.app',
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:8081',
+    process.env.FRONTEND_URL || 'http://localhost:3000'
+  ],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
