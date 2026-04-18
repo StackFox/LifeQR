@@ -153,15 +153,15 @@ const MEDICAL_VECTOR_COLLECTION = 'medical_records_rag_v1';
 
 // CORS Configuration
 const corsOptions = {
-  origin: [
-    'https://life-qr-frontend.vercel.app',
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'http://localhost:8081',
-    process.env.FRONTEND_URL || 'http://localhost:3000'
-  ],
-  credentials: true,
-  optionsSuccessStatus: 200
+    origin: [
+        'https://life-qr-frontend.vercel.app',
+        'http://localhost:3000',
+        'http://localhost:5173',
+        'http://localhost:8081',
+        process.env.FRONTEND_URL || 'http://localhost:3000'
+    ],
+    credentials: true,
+    optionsSuccessStatus: 200
 };
 
 // Middleware
